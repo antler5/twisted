@@ -388,6 +388,7 @@ async def _flattenTree(
 
     @return: A C{Deferred}-returning coroutine that resolves to C{None}.
     """
+    pendingDeferred = None
     buf = []
     bufSize = 0
 
@@ -399,6 +400,31 @@ async def _flattenTree(
         bufSize += len(bs)
         if bufSize >= BUFFER_SIZE:
             flushBuffer()
+
+    def deferredWrite(bs: bytes) -> None:
+        if pendingDeferred is None:
+            bufferedWrite(bs)
+        else:
+            pendingDeferred.addCallback(lambda *_: bufferedWrite(bs))
+
+    def registerDeferred(d: Deferred) -> None:
+        nonlocal pendingDeferred
+        pdRef = pendingDeferred
+
+        def maybeKeepGoing(*result):
+            nonlocal pendingDeferred
+            nonlocal pdRef
+            if isinstance(result[0], Iterator):
+                pendingDeferred = Deferred()
+                if pdRef is not None:
+                    pendingDeferred.addCallback(lambda *_: pdRef)
+                process_stack([result[0]])
+                return pendingDeferred.callback(None)
+            return result
+
+        pendingDeferred = d.addCallback(lambda *result: maybeKeepGoing(*result))
+        if pdRef is not None:
+            d.addCallback(lambda *_: pdRef)
 
     # Deliver the buffered content to the upstream writer as a single string.
     # This is how a "big enough" buffer gets delivered, how a buffer of any
@@ -413,31 +439,33 @@ async def _flattenTree(
             bufSize = 0
 
     stack: List[Generator[Any, Any, Any]] = [
-        _flattenElement(request, root, bufferedWrite, [], None, escapeForContent)
+        _flattenElement(request, root, deferredWrite, [], None, escapeForContent)
     ]
 
-    while stack:
-        try:
-            element = next(stack[-1])
-            if isinstance(element, Deferred):
-                # Before suspending flattening for an unknown amount of time,
-                # flush whatever data we have collected so far.
-                flushBuffer()
-                element = await element
-        except StopIteration:
-            stack.pop()
-        except Exception as e:
-            roots = []
-            for generator in stack:
-                if generator.gi_frame is not None:
-                    roots.append(generator.gi_frame.f_locals["root"])
-            stack.pop()
-            raise FlattenerError(e, roots, extract_tb(exc_info()[2]))
-        else:
-            stack.append(element)
+    def process_stack(stack):
+        nonlocal pendingDeferred
+        while stack:
+            try:
+                element = next(stack[-1])
+                if isinstance(element, Deferred):
+                    registerDeferred(element)
+                else:
+                    stack.append(element)
+            except StopIteration:
+                stack.pop()
+            except Exception as e:
+                roots = []
+                for generator in stack:
+                    if generator.gi_frame is not None:
+                        roots.append(generator.gi_frame.f_locals["root"])
+                stack.pop()
+                raise FlattenerError(e, roots, extract_tb(exc_info()[2]))
+        flushBuffer()
 
-    # Flush any data that remains in the buffer before finishing.
-    flushBuffer()
+        pendingDeferred.addCallback(lambda *_: flushBuffer())
+        return pendingDeferred
+
+    await process_stack(stack)
 
 
 def flatten(
